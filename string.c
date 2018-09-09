@@ -5110,6 +5110,196 @@ rb_str_sub(int argc, VALUE *argv, VALUE str)
 }
 
 static VALUE
+str_gsub_str_cached(VALUE pat, VALUE repl, VALUE str, int bang, long rsize,
+                    long *pat_pos, VALUE *matches) {
+    long blen = rsize + 30;
+    VALUE dest = rb_str_buf_new(blen);
+    VALUE val = Qnil;
+    rb_encoding *str_enc;
+    int tainted = OBJ_TAINTED_RAW(repl);
+
+    long patsize = RSTRING_LEN(pat);
+    /*
+     * Always consume at least one character of the input string
+     * in order to prevent infinite loops.
+     */
+    long advance_by = patsize == 0 ? 1 : patsize;
+    long spos = 0;
+    long pos = 0;
+    long prematch_len = 0;
+    long slen = RSTRING_LEN(str);
+    char *sp = RSTRING_PTR(str);
+    char *se = RSTRING_END(str);
+    long repl_cnt = 0;
+    assert(pat_pos && matches);
+
+    str_enc = STR_ENC_GET(str);
+    rb_enc_associate(dest, str_enc);
+    ENC_CODERANGE_SET(dest, rb_enc_asciicompat(str_enc) ? ENC_CODERANGE_7BIT : ENC_CODERANGE_VALID);
+
+    pos = pat_pos[0];
+    for (long i = 1; pos >= 0; ++i) {
+        /* 'a'.gsub('', 'x') gives 'xax', this code handles this case */
+        if (repl_cnt != 0 && patsize == 0) {
+            prematch_len = rb_enc_fast_mbclen(sp + spos - 1, se, str_enc);
+            rb_enc_str_buf_cat(dest, sp + spos - 1, prematch_len, str_enc);
+        } else {
+            prematch_len = pos - spos;
+            if (prematch_len) {
+                rb_enc_str_buf_cat(dest, sp + spos, prematch_len, str_enc);
+            }
+        }
+        spos = pos + advance_by;
+
+        if (matches[i - 1]) {
+            val = matches[i - 1];
+        } else {
+            val = repl;
+        }
+
+        rb_str_buf_append(dest, val);
+        tainted |= OBJ_TAINTED_RAW(val);
+        ++repl_cnt;
+
+        pos = pat_pos[i];
+    }
+
+    if (repl_cnt == 0) {
+        return bang ? Qnil : rb_str_dup(str);
+    }
+
+    if (spos < slen) {
+        rb_enc_str_buf_cat(dest, sp + spos, slen - spos, str_enc);
+    }
+
+    if (bang) {
+        str_shared_replace(str, dest);
+    } else {
+        RBASIC_SET_CLASS(dest, rb_obj_class(str));
+        tainted |= OBJ_TAINTED_RAW(str);
+        str = dest;
+    }
+
+    FL_SET_RAW(str, tainted);
+    return str;
+}
+
+static VALUE
+str_gsub_str_easy(VALUE pat, VALUE repl, VALUE str, int bang, int need_backref) {
+    long slen = RSTRING_LEN(str);
+    VALUE dest = rb_str_buf_new(slen + 30);
+    VALUE val = Qnil;
+    VALUE match;
+    struct re_registers *regs;
+    rb_encoding *str_enc;
+    int tainted = OBJ_TAINTED_RAW(repl);
+
+    long advance_by = RSTRING_LEN(pat);
+    long spos = 0;
+    long prematch_len = 0;
+
+    char *sp = RSTRING_PTR(str);
+    long repl_cnt = 0;
+
+    str_enc = STR_ENC_GET(str);
+    rb_enc_associate(dest, str_enc);
+    ENC_CODERANGE_SET(dest, rb_enc_asciicompat(str_enc) ? ENC_CODERANGE_7BIT : ENC_CODERANGE_VALID);
+
+    for (long pos = rb_pat_search(pat, str, 0, need_backref);
+         pos >= 0; pos = rb_pat_search(pat, str, pos + advance_by, need_backref)) {
+        prematch_len = pos - spos;
+        if (prematch_len) {
+            rb_enc_str_buf_cat(dest, sp + spos, prematch_len, str_enc);
+        }
+        spos = pos + advance_by;
+
+        if (need_backref) {
+            match = rb_backref_get();
+            regs = RMATCH_REGS(match);
+            val = rb_reg_regsub(repl, str, regs, Qnil);
+            if (need_backref < 0)
+                need_backref = val != repl;
+        } else {
+            val = repl;
+        }
+
+        rb_str_buf_append(dest, val);
+        tainted |= OBJ_TAINTED_RAW(val);
+        ++repl_cnt;
+    }
+
+    if (repl_cnt == 0) {
+        return bang ? Qnil : rb_str_dup(str);
+    }
+
+    if (spos < slen) {
+        rb_enc_str_buf_cat(dest, sp + spos, slen - spos, str_enc);
+    }
+
+    if (bang) {
+        str_shared_replace(str, dest);
+    } else {
+        RBASIC_SET_CLASS(dest, rb_obj_class(str));
+        tainted |= OBJ_TAINTED_RAW(str);
+        str = dest;
+    }
+
+    FL_SET_RAW(str, tainted);
+    return str;
+}
+
+static VALUE
+str_gsub_str(VALUE pat, VALUE repl, VALUE str, int bang, int need_backref) {
+    long rcnt = 0;
+    long from_len = RSTRING_LEN(pat);
+    long to_len = RSTRING_LEN(repl);
+    long slen = RSTRING_LEN(str);
+    long sz_diff = to_len - from_len;
+    long rsize;
+    long *pat_pos;
+    VALUE match;
+    struct re_registers *regs;
+    VALUE *matches;
+    VALUE ret;
+
+    /* easy case, no special processing to avoid reallocations is needed */
+    if (to_len <= from_len) {
+        return str_gsub_str_easy(pat, repl, str, bang, need_backref);
+    }
+
+    /* cache for found substring positions */
+    pat_pos = xmalloc(sizeof(long) * (slen + 2));
+    matches = xmalloc(sizeof(VALUE) * (slen + 1));
+    /* no infinite loops */
+    if (from_len == 0) {
+        from_len = 1;
+    }
+    for (long pos = rb_pat_search(pat, str, 0, need_backref);
+         pos >= 0; pos = rb_pat_search(pat, str, pos + from_len, need_backref)) {
+        pat_pos[rcnt] = pos;
+        if (need_backref) {
+            match = rb_backref_get();
+            regs = RMATCH_REGS(match);
+            matches[rcnt] = rb_reg_regsub(repl, str, regs, Qnil);
+            if (need_backref < 0) {
+                need_backref = matches[rcnt] != repl;
+            }
+        } else {
+            matches[rcnt] = 0;
+        }
+        ++rcnt;
+    }
+    pat_pos[rcnt] = -1;
+
+    /* estimate result size assuming there will be no multiple backreferences */
+    rsize = slen + sz_diff * rcnt;
+    ret = str_gsub_str_cached(pat, repl, str, bang, rsize, pat_pos, matches);
+    xfree(pat_pos);
+    xfree(matches);
+    return ret;
+}
+
+static VALUE
 str_gsub(int argc, VALUE *argv, VALUE str, int bang)
 {
     VALUE pat, val = Qnil, repl, match, match0 = Qnil, dest, hash = Qnil;
@@ -5143,6 +5333,11 @@ str_gsub(int argc, VALUE *argv, VALUE str, int bang)
     }
 
     pat = get_pat_quoted(argv[0], 1);
+
+    /* in case of string pattern substitution can be optimized */
+    if (mode == STR && RB_TYPE_P(pat, T_STRING))
+        return str_gsub_str(pat, repl, str, bang, need_backref);
+
     beg = rb_pat_search(pat, str, 0, need_backref);
     if (beg < 0) {
 	if (bang) return Qnil;	/* no match, no substitution */
